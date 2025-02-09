@@ -38,6 +38,8 @@
     ]
   },
   "dependencies": {
+    "ulid": "^2.3.0",
+    "mnemonist": "^0.39.6"
   },
   "devDependencies": {
     "@commitlint/cli": "^17.4.2",

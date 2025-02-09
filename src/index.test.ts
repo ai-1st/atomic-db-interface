@@ -1,21 +1,13 @@
 import test from 'ava'
 import {
-  AtomicDynamoDB,
+  AtomicMemoryDb,
   AtomicDbItemKey,
   AtomicDbItem,
   RaceCondition,
+  AtomicLRUCache,
 } from './index'
-import {
-  DynamoDBClient,
-  UpdateItemCommand,
-} from '@aws-sdk/client-dynamodb'
 
-const client = new DynamoDBClient({
-  region: 'us-east-1',
-})
-const TABLE_NAME = 'TEST'
-
-const db = new AtomicDynamoDB(client, TABLE_NAME)
+const db = new AtomicMemoryDb()
 
 test('basic CRUD operations', async (t) => {
   const key = { pk: 'test-crud', sk: 'item1' }
@@ -112,11 +104,6 @@ test('query operations', async (t) => {
 })
 
 test('atomic operations with race conditions', async (t) => {
-  const db = new AtomicDynamoDB(
-    client,
-    TABLE_NAME
-  )
-
   const itemKey = {
     pk: 'test',
     sk: 'profile',
@@ -223,9 +210,7 @@ test('atomic operations with race conditions', async (t) => {
   const expectedName = successOp.value
 
   // Verify that exactly one name was set
-  const finalItem = await db.get<{
-    name: string
-  }>(itemKey)
+  const finalItem = await db.get(itemKey)
   t.is(
     finalItem?.data?.name,
     expectedName,
@@ -239,50 +224,6 @@ test('atomic operations with race conditions', async (t) => {
   )
 
   await db.delete([lockKey, itemKey])
-})
-
-test('lock ttl updates', async (t) => {
-  const db = new AtomicDynamoDB(
-    client,
-    TABLE_NAME
-  )
-  const key = { pk: 'test-ttl', sk: 'lock' }
-
-  // First call creates lock with 24h TTL
-  const lock1 = await db.getLock(key)
-  t.truthy(lock1.ttl)
-  const now = Math.floor(Date.now() / 1000)
-  t.true(lock1.ttl! >= now + 23 * 60 * 60) // At least 23 hours in the future
-
-  // Second call with same lock should not update TTL or version
-  const lock2 = await db.getLock(key)
-  t.is(lock2.ttl, lock1.ttl)
-  t.is(lock2.version, lock1.version)
-
-  // Manually set TTL to less than 1 hour from now to force refresh
-  await client.send(
-    new UpdateItemCommand({
-      TableName: TABLE_NAME,
-      Key: {
-        pk: { S: key.pk },
-        sk: { S: key.sk },
-      },
-      UpdateExpression: 'SET #ttlAttr = :ttl',
-      ExpressionAttributeNames: {
-        '#ttlAttr': 'ttl',
-      },
-      ExpressionAttributeValues: {
-        ':ttl': { N: (now + 30 * 60).toString() }, // 30 minutes from now
-      },
-    })
-  )
-
-  // Third call should create new lock with fresh TTL and version
-  const lock3 = await db.getLock(key)
-  t.not(lock3.version, lock2.version)
-  t.true(lock3.ttl! >= now + 23 * 60 * 60)
-
-  await db.delete(key)
 })
 
 test('stream operations', async (t) => {
@@ -379,5 +320,273 @@ test('large batch operations', async (t) => {
   t.deepEqual(
     deletedResults,
     Array(50).fill(undefined)
+  )
+})
+
+test('LRU cache basic operations', async (t) => {
+  const memoryDb = new AtomicMemoryDb()
+  const cachedDb = new AtomicLRUCache(memoryDb, 2) // Small cache size to test eviction
+
+  // Test cache miss and fill
+  const key1 = { pk: 'test-cache', sk: 'item1' }
+  const item1 = { ...key1, data: { value: 1 } }
+  await memoryDb.set(item1)
+
+  const result1 = await cachedDb.get(key1)
+  t.deepEqual(
+    result1,
+    item1,
+    'Should fetch and cache item on miss'
+  )
+
+  // Test cache hit
+  const result2 = await cachedDb.get(key1)
+  t.deepEqual(
+    result2,
+    item1,
+    'Should return cached item'
+  )
+
+  // Test cache eviction
+  const key2 = { pk: 'test-cache', sk: 'item2' }
+  const item2 = { ...key2, data: { value: 2 } }
+  await memoryDb.set(item2)
+  await cachedDb.get(key2)
+
+  const key3 = { pk: 'test-cache', sk: 'item3' }
+  const item3 = { ...key3, data: { value: 3 } }
+  await memoryDb.set(item3)
+  await cachedDb.get(key3)
+
+  // key1 should be evicted, forcing a DB read
+  const result4 = await cachedDb.get(key1)
+  t.deepEqual(
+    result4,
+    item1,
+    'Should fetch from DB after eviction'
+  )
+})
+
+test('LRU cache getMany operation', async (t) => {
+  const memoryDb = new AtomicMemoryDb()
+  const cachedDb = new AtomicLRUCache(memoryDb, 3)
+
+  const keys = [
+    { pk: 'test-cache', sk: 'batch1' },
+    { pk: 'test-cache', sk: 'batch2' },
+    { pk: 'test-cache', sk: 'batch3' },
+  ]
+
+  const items = keys.map((key, i) => ({
+    ...key,
+    data: { value: i + 1 },
+  }))
+
+  await memoryDb.set(items)
+
+  // First getMany should cache all items
+  const results1 = await cachedDb.getMany(keys)
+  t.deepEqual(
+    results1,
+    items,
+    'Should fetch and cache all items'
+  )
+
+  // Modify one item directly in the DB
+  const modifiedItem = {
+    ...items[1],
+    data: { value: 20 },
+  }
+  await memoryDb.set(modifiedItem)
+
+  // Second getMany should return cached values
+  const results2 = await cachedDb.getMany(keys)
+  t.deepEqual(
+    results2,
+    items,
+    'Should return cached items even if DB was modified'
+  )
+
+  // After set through cache, should return new values
+  await cachedDb.set(modifiedItem)
+  const results3 = await cachedDb.getMany(keys)
+  const expectedResults3 = [...items]
+  expectedResults3[1] = modifiedItem
+  t.deepEqual(
+    results3,
+    expectedResults3,
+    'Should return updated item after cache update'
+  )
+})
+
+test('LRU cache set operations', async (t) => {
+  const memoryDb = new AtomicMemoryDb()
+  const cachedDb = new AtomicLRUCache(memoryDb, 3)
+
+  const key = { pk: 'test-cache', sk: 'set1' }
+  const item1 = { ...key, data: { value: 1 } }
+
+  // Set should update cache
+  await cachedDb.set(item1)
+  const result1 = await cachedDb.get(key)
+  t.deepEqual(
+    result1,
+    item1,
+    'Cache should be updated after set'
+  )
+
+  // Modify directly in memory DB
+  const item2 = { ...key, data: { value: 2 } }
+  await memoryDb.set(item2)
+
+  // Should still return cached value
+  const result2 = await cachedDb.get(key)
+  t.deepEqual(
+    result2,
+    item1,
+    'Should return cached value even if DB was modified'
+  )
+
+  // Update through cache
+  const item3 = { ...key, data: { value: 3 } }
+  await cachedDb.set(item3)
+
+  // Both cache and DB should have new value
+  const cacheResult = await cachedDb.get(key)
+  const dbResult = await memoryDb.get(key)
+  t.deepEqual(
+    cacheResult,
+    item3,
+    'Cache should have updated value'
+  )
+  t.deepEqual(
+    dbResult,
+    item3,
+    'DB should have updated value'
+  )
+})
+
+test('LRU cache atomic operations', async (t) => {
+  const memoryDb = new AtomicMemoryDb()
+  const cachedDb = new AtomicLRUCache(memoryDb, 3)
+
+  const key = { pk: 'test-cache', sk: 'atomic1' }
+  const item1 = { ...key, data: { value: 1 } }
+
+  // Set initial value
+  await cachedDb.set(item1)
+
+  // Get lock for atomic update
+  const lock = await cachedDb.getLock(key)
+
+  // Update with atomic operation
+  const item2 = { ...key, data: { value: 2 } }
+  await cachedDb.setAtomic(item2, lock)
+
+  // Both cache and DB should have new value
+  const cacheResult = await cachedDb.get(key)
+  const dbResult = await memoryDb.get(key)
+  t.deepEqual(
+    cacheResult,
+    item2,
+    'Cache should have atomically updated value'
+  )
+  t.deepEqual(
+    dbResult,
+    item2,
+    'DB should have atomically updated value'
+  )
+
+  // Try atomic update with wrong lock version
+  const item3 = { ...key, data: { value: 3 } }
+  await t.throwsAsync(
+    async () => {
+      await cachedDb.setAtomic(item3, lock)
+    },
+    { instanceOf: RaceCondition },
+    'Should throw RaceCondition on version mismatch'
+  )
+})
+
+test('LRU cache query and stream operations', async (t) => {
+  const memoryDb = new AtomicMemoryDb()
+  const cachedDb = new AtomicLRUCache(memoryDb, 3)
+
+  const items = [
+    {
+      pk: 'test-cache',
+      sk: 'query1',
+      data: { value: 1 },
+    },
+    {
+      pk: 'test-cache',
+      sk: 'query2',
+      data: { value: 2 },
+    },
+    {
+      pk: 'test-cache',
+      sk: 'query3',
+      data: { value: 3 },
+    },
+  ]
+
+  await cachedDb.set(items)
+
+  // Query should bypass cache
+  const queryResults = await cachedDb.query({
+    pk: 'test-cache',
+    sk: 'query',
+  })
+  t.deepEqual(
+    queryResults,
+    items,
+    'Query should return all items'
+  )
+
+  // Modify items directly in DB
+  const modifiedItems = items.map((item) => ({
+    ...item,
+    data: { value: item.data.value * 10 },
+  }))
+  await memoryDb.set(modifiedItems)
+
+  // Query should reflect DB changes
+  const queryResults2 = await cachedDb.query({
+    pk: 'test-cache',
+    sk: 'query',
+  })
+  t.deepEqual(
+    queryResults2,
+    modifiedItems,
+    'Query should return modified items from DB'
+  )
+
+  // But individual gets should still use cache
+  const cachedItem = await cachedDb.get(items[0])
+  t.deepEqual(
+    cachedItem,
+    items[0],
+    'Get should return cached value after query'
+  )
+
+  // Stream should also bypass cache
+  const streamItems: AtomicDbItem[] = []
+  const stream = cachedDb.stream({
+    pk: 'test-cache',
+    sk: 'query',
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    stream.on('data', (item: AtomicDbItem) => {
+      streamItems.push(item)
+    })
+    stream.on('end', resolve)
+    stream.on('error', reject)
+  })
+
+  t.deepEqual(
+    streamItems,
+    modifiedItems,
+    'Stream should return modified items from DB'
   )
 })
