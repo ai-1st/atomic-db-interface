@@ -1,5 +1,5 @@
 {
-  "name": "atomic-db",
+  "name": "atomic-db-interface",
   "version": "1.0.0",
   "description": "A lightweight database wrapper with single-table design support and optimistic locking.",
   "repository": {
@@ -38,8 +38,8 @@
     ]
   },
   "dependencies": {
-    "ulid": "^2.3.0",
-    "mnemonist": "^0.39.6"
+    "mnemonist": "^0.39.8",
+    "ulid": "^2.3.0"
   },
   "devDependencies": {
     "@commitlint/cli": "^17.4.2",
