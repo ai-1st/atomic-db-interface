@@ -1,35 +1,45 @@
-# Atomic DB
+# Atomic DB Interface
 
-A TypeScript library supporting a range of databases that provides atomic operations with optimistic locking.
+A TypeScript interface and implementations for databases supporting atomic operations with optimistic locking.
 
 ## Features
 
+- **Database Agnostic Interface**: Provides a common interface for any database implementation
 - **Atomic Operations**: Perform atomic updates with optimistic locking to prevent race conditions
 - **Separate Lock Objects**: Lock objects are stored separately from items, allowing for flexible locking strategies
 - **Automatic Lock Management**: Locks automatically expire after 24 hours and refresh when nearing expiration
 - **Type Safety**: Full TypeScript support with generic types for item data
 - **Streaming**: Stream query results for efficient processing of large datasets
 - **Batch Operations**: Efficient batch operations for non-atomic updates
+- **In-Memory Implementation**: Includes a ready-to-use in-memory implementation for testing
+- **LRU Caching**: Optional LRU cache wrapper for improved performance
 
-## Installation For DynamoDB
+## Installation
 
 ```bash
-npm install atomic-dynamodb
+npm install atomic-db-interface
 ```
 
 ## Usage
 
-### Basic Setup for DynamoDB
+### Basic Setup with In-Memory Implementation
 
 ```typescript
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { AtomicDynamoDB } from '@ai-1st/atomic-dynamodb'
+import { AtomicMemoryDb } from 'atomic-db-interface'
 
-const client = new DynamoDBClient({
-  region: 'us-west-2',
-})
+const db = new AtomicMemoryDb()
+```
 
-const db = new AtomicDynamoDB(client, 'my-table')
+### Setup with LRU Cache
+
+```typescript
+import {
+  AtomicMemoryDb,
+  AtomicLRUCache,
+} from 'atomic-db-interface'
+
+const memDb = new AtomicMemoryDb()
+const db = new AtomicLRUCache(memDb, 1000) // Cache size of 1000 items
 ```
 
 ### Simple Operations
@@ -58,6 +68,8 @@ await db.delete({
 ### Atomic Operations
 
 ```typescript
+import { RaceCondition } from 'atomic-db-interface'
+
 // Define keys for the data item and its lock
 const itemKey = {
   pk: 'user#123',
@@ -173,13 +185,38 @@ const stream = db.stream({
 })
 ```
 
+## Interface and Implementations
+
+This package provides the `AtomicDbInterface` which can be implemented by any database adapter. It includes two ready-to-use implementations:
+
+### AtomicMemoryDb
+
+An in-memory implementation perfect for testing and development. Supports all features including TTL-based expiration.
+
+### AtomicLRUCache
+
+A wrapper that adds LRU caching to any `AtomicDbInterface` implementation. Does not cache locks (they must always be fresh) or query results.
+
+### Custom Implementations
+
+You can implement `AtomicDbInterface` for any database. The interface defines:
+
+- `get(key)` - Get a single item
+- `getMany(keys)` - Get multiple items
+- `getLock(key)` - Get or create a lock with automatic TTL management
+- `set(items)` - Set items without atomicity
+- `setAtomic(items, locks)` - Set items atomically with lock verification
+- `delete(keys)` - Delete items
+- `query(query)` - Query items by primary key and optional sort key prefix
+- `stream(query)` - Stream query results
+
 ## Lock Management
 
-The library uses optimistic locking with automatic TTL management to prevent race conditions in atomic operations. Here's how it works:
+The interface uses optimistic locking with automatic TTL management to prevent race conditions in atomic operations. Here's how it works:
 
 1. Lock objects are stored separately from the actual items using different sort keys
 2. Each lock object has a version that's updated on every atomic operation
-3. Locks automatically expire after 24 hours via DynamoDB's TTL feature
+3. Locks automatically expire after 24 hours via TTL feature
 4. When a lock is accessed within its last hour of validity, it's automatically refreshed with a new 24-hour TTL
 5. The `setAtomic` method requires both the item to update and its corresponding lock
 6. If the lock's version has changed since it was read, the operation fails with a `RaceCondition` error
@@ -193,10 +230,21 @@ This approach allows for:
 
 ## Error Handling
 
-The library throws the following errors:
+The interface defines the following error types:
 
 - `RaceCondition`: Thrown when an atomic operation fails due to concurrent modifications
-- `Error`: Standard error for invalid operations or DynamoDB errors
+- `Error`: Standard error for invalid operations or database-specific errors
+
+## TypeScript Types
+
+The package exports these key types:
+
+- `AtomicDbInterface`: Main interface for database implementations
+- `AtomicDbItemKey`: Database item key structure (pk, sk)
+- `AtomicDbItem`: Generic database item with optional data and TTL
+- `AtomicDbItemLock`: Lock object with version and TTL
+- `AtomicDbQuery`: Query options for database operations
+- `RaceCondition`: Error class for race condition detection
 
 ## License
 

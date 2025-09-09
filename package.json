@@ -1,6 +1,6 @@
 {
   "name": "atomic-db-interface",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A lightweight database wrapper with single-table design support and optimistic locking.",
   "repository": {
     "type": "git",
