@@ -116,7 +116,8 @@ export interface AtomicDbInterface {
   /**
    * Get multiple items by their keys
    * @param keys The database item keys
-   * @returns Array with same length as input keys array. Each element will be the corresponding item or undefined if not found.
+   * @returns Array with same length as input keys array. Each element will be the
+   * corresponding item or undefined if not found.
    */
   getMany(
     keys: AtomicDbItemKey[]
@@ -125,7 +126,8 @@ export interface AtomicDbInterface {
   /**
    * Get a lock object by its key directly from the DB
    * If the item doesn't exist, creates a new one with a version and 24h TTL.
-   * If the item exists but TTL is less than 1h away, recreates it with a new version and 24h TTL.
+   * If the item exists but TTL is less than 1h away, recreates it with a new version
+   * and 24h TTL.
    * Lock objects are separate from regular items and are used for optimistic locking.
    *
    * Optimistic locking pattern:
@@ -133,7 +135,8 @@ export interface AtomicDbInterface {
    * 2. Get the current data item(s)
    * 3. Perform business logic calculations
    * 4. Use setAtomic with the lock(s) to update the item(s) atomically
-   * 5. If setAtomic throws RaceCondition, the lock version changed - reload locks and retry from step 1
+   * 5. If setAtomic throws RaceCondition, the lock version changed - reload locks and retry
+   * from step 1
    *
    * @param key The database item key
    * @returns The found lock object or a new one with initial version
@@ -154,7 +157,8 @@ export interface AtomicDbInterface {
   /**
    * Set one or multiple items atomically with optimistic locking
    * Each item requires a corresponding lock object for version checking.
-   * Lock objects are stored separately from the items and are updated with new versions after successful operations.
+   * Lock objects are stored separately from the items and are updated with new versions
+   * after successful operations.
    * @param items The items to set
    * @param locks The lock objects to check versions against. Must match items one-to-one.
    * @throws {RaceCondition} If version check fails
@@ -192,7 +196,8 @@ export interface AtomicDbInterface {
 
   /**
    * Push one or more items to a FIFO queue
-   * @param items The items to push to the queue (isProcessing and processingTimeout are set automatically)
+   * @param items The items to push to the queue (isProcessing and processingTimeout
+   * are set automatically)
    */
   queuePush(
     items:

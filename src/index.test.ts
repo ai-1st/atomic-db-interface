@@ -754,7 +754,7 @@ test('queue with custom sk maintains order', async (t) => {
   )
 })
 
-test('queue strict FIFO prevents pulling next item until previous is acknowledged', async (t) => {
+test('queue strict FIFO prevents pulling next item until previous is ack', async (t) => {
   const queuePk = 'test-queue-locks'
 
   await db.queuePush([
