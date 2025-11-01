@@ -590,3 +590,378 @@ test('LRU cache query and stream operations', async (t) => {
     'Stream should return modified items from DB'
   )
 })
+
+test('queue basic push/pull/acknowledge flow', async (t) => {
+  const queuePk = 'test-queue-basic'
+
+  // Push items to queue
+  await db.queuePush([
+    { pk: queuePk, data: { message: 'first' } },
+    { pk: queuePk, data: { message: 'second' } },
+    { pk: queuePk, data: { message: 'third' } },
+  ])
+
+  // Pull first item
+  const result1 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.truthy(result1.item, 'Should pull an item')
+  t.is(
+    result1.item?.data.message,
+    'first',
+    'Should pull first item (FIFO)'
+  )
+
+  // Try to pull again while first is processing - should return empty (strict FIFO)
+  const result2 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result2.item,
+    undefined,
+    'Should return empty while first item is processing (strict FIFO)'
+  )
+
+  // Acknowledge first item
+  await db.queueAcknowledge({
+    pk: result1.item!.pk,
+    sk: result1.item!.sk,
+  })
+
+  // Now can pull second item
+  const result2AfterAck = await db.queuePull({
+    pk: queuePk,
+  })
+  t.truthy(
+    result2AfterAck.item,
+    'Should pull second item after first is acknowledged'
+  )
+  t.is(
+    result2AfterAck.item?.data.message,
+    'second',
+    'Should pull second item (FIFO)'
+  )
+
+  // Verify first item is deleted
+  const check = await db.get({
+    pk: result1.item!.pk,
+    sk: result1.item!.sk,
+  })
+  t.is(
+    check,
+    undefined,
+    'First item should be deleted'
+  )
+
+  // Acknowledge second item
+  await db.queueAcknowledge({
+    pk: result2AfterAck.item!.pk,
+    sk: result2AfterAck.item!.sk,
+  })
+
+  // Pull third item
+  const result3 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result3.item?.data.message,
+    'third',
+    'Should pull third item'
+  )
+
+  // Acknowledge third item
+  await db.queueAcknowledge({
+    pk: result3.item!.pk,
+    sk: result3.item!.sk,
+  })
+
+  // Queue should be empty
+  const result4 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result4.item,
+    undefined,
+    'Queue should be empty'
+  )
+})
+
+test('queue FIFO ordering with auto-generated sk', async (t) => {
+  const queuePk = 'test-queue-ordering'
+
+  // Push items without sk (should auto-generate)
+  await db.queuePush({ pk: queuePk, data: 1 })
+  await new Promise((resolve) =>
+    setTimeout(resolve, 10)
+  ) // Small delay for ULID ordering
+  await db.queuePush({ pk: queuePk, data: 2 })
+  await new Promise((resolve) =>
+    setTimeout(resolve, 10)
+  )
+  await db.queuePush({ pk: queuePk, data: 3 })
+
+  // Pull items in order
+  const results: number[] = []
+  for (let i = 0; i < 3; i++) {
+    const result = await db.queuePull({
+      pk: queuePk,
+    })
+    if (result.item) {
+      results.push(result.item.data)
+      await db.queueAcknowledge({
+        pk: result.item.pk,
+        sk: result.item.sk,
+      })
+    }
+  }
+
+  t.deepEqual(
+    results,
+    [1, 2, 3],
+    'Items should be pulled in FIFO order'
+  )
+})
+
+test('queue with custom sk maintains order', async (t) => {
+  const queuePk = 'test-queue-custom-sk'
+
+  // Push items with custom sk
+  await db.queuePush([
+    { pk: queuePk, sk: 'task-001', data: 'A' },
+    { pk: queuePk, sk: 'task-002', data: 'B' },
+    { pk: queuePk, sk: 'task-003', data: 'C' },
+  ])
+
+  // Pull items
+  const results: string[] = []
+  for (let i = 0; i < 3; i++) {
+    const result = await db.queuePull({
+      pk: queuePk,
+    })
+    if (result.item) {
+      results.push(result.item.data)
+      await db.queueAcknowledge({
+        pk: result.item.pk,
+        sk: result.item.sk,
+      })
+    }
+  }
+
+  t.deepEqual(
+    results,
+    ['A', 'B', 'C'],
+    'Items should maintain custom sk order'
+  )
+})
+
+test('queue strict FIFO prevents pulling next item until previous is acknowledged', async (t) => {
+  const queuePk = 'test-queue-locks'
+
+  await db.queuePush([
+    { pk: queuePk, sk: 'item1', data: 1 },
+    { pk: queuePk, sk: 'item2', data: 2 },
+  ])
+
+  // Pull first item
+  const result1 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result1.item?.data,
+    1,
+    'First pull gets item1'
+  )
+
+  // Try to pull again - should return empty (strict FIFO - can't pull next until first is done)
+  const result2 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result2.item,
+    undefined,
+    'Should return empty while first item is processing (strict FIFO)'
+  )
+
+  // Acknowledge first item
+  await db.queueAcknowledge({
+    pk: result1.item!.pk,
+    sk: result1.item!.sk,
+  })
+
+  // Now can pull second item
+  const result3 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result3.item?.data,
+    2,
+    'Can pull item2 after item1 is acknowledged'
+  )
+
+  // Clean up
+  await db.queueAcknowledge({
+    pk: result3.item!.pk,
+    sk: result3.item!.sk,
+  })
+})
+
+test('queue lock TTL expiration makes item available again', async (t) => {
+  const queuePk = 'test-queue-ttl'
+
+  await db.queuePush({
+    pk: queuePk,
+    sk: 'item1',
+    data: 'test',
+  })
+
+  // Pull with 1 second TTL
+  const result1 = await db.queuePull({
+    pk: queuePk,
+    ttlSeconds: 1,
+  })
+  t.truthy(result1.item, 'Item should be pulled')
+
+  // Try to pull immediately - should be locked
+  const result2 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result2.item,
+    undefined,
+    'Item should be locked'
+  )
+
+  // Wait for lock to expire
+  await new Promise((resolve) =>
+    setTimeout(resolve, 1100)
+  )
+
+  // Should be able to pull again
+  const result3 = await db.queuePull({
+    pk: queuePk,
+  })
+  t.truthy(
+    result3.item,
+    'Item should be available after lock expires'
+  )
+  t.is(
+    result3.item?.data,
+    'test',
+    'Should get same item'
+  )
+
+  // Clean up
+  await db.queueAcknowledge({
+    pk: result3.item!.pk,
+    sk: result3.item!.sk,
+  })
+})
+
+test('queue multiple consumers process items sequentially (strict FIFO)', async (t) => {
+  const queuePk = 'test-queue-multi'
+
+  // Push 5 items
+  await db.queuePush([
+    { pk: queuePk, data: 1 },
+    { pk: queuePk, data: 2 },
+    { pk: queuePk, data: 3 },
+    { pk: queuePk, data: 4 },
+    { pk: queuePk, data: 5 },
+  ])
+
+  // Simulate consumers processing items sequentially (strict FIFO)
+  // With strict FIFO, only one item can be processed at a time
+  const results: number[] = []
+
+  // Process items sequentially - each pull must acknowledge before next can be pulled
+  for (let i = 0; i < 5; i++) {
+    const result = await db.queuePull({
+      pk: queuePk,
+    })
+    if (result.item) {
+      results.push(result.item.data)
+      await db.queueAcknowledge({
+        pk: result.item.pk,
+        sk: result.item.sk,
+      })
+    }
+  }
+
+  // All items should be processed in order
+  t.deepEqual(
+    results,
+    [1, 2, 3, 4, 5],
+    'All items should be processed exactly once in FIFO order'
+  )
+
+  // Queue should be empty
+  const final = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    final.item,
+    undefined,
+    'Queue should be empty'
+  )
+})
+
+test('queue empty queue handling', async (t) => {
+  const queuePk = 'test-queue-empty'
+
+  // Try to pull from empty queue
+  const result = await db.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    result.item,
+    undefined,
+    'No item from empty queue'
+  )
+})
+
+test('queue with LRU cache', async (t) => {
+  const memoryDb = new AtomicMemoryDb()
+  const cachedDb = new AtomicLRUCache(
+    memoryDb,
+    10
+  )
+  const queuePk = 'test-queue-cache'
+
+  // Push items through cache
+  await cachedDb.queuePush([
+    { pk: queuePk, data: 'A' },
+    { pk: queuePk, data: 'B' },
+    { pk: queuePk, data: 'C' },
+  ])
+
+  // Pull and acknowledge through cache
+  const results: string[] = []
+  for (let i = 0; i < 3; i++) {
+    const result = await cachedDb.queuePull({
+      pk: queuePk,
+    })
+    if (result.item) {
+      results.push(result.item.data)
+      await cachedDb.queueAcknowledge({
+        pk: result.item.pk,
+        sk: result.item.sk,
+      })
+    }
+  }
+
+  t.deepEqual(
+    results,
+    ['A', 'B', 'C'],
+    'Queue should work through cache'
+  )
+
+  // Verify queue is empty
+  const final = await cachedDb.queuePull({
+    pk: queuePk,
+  })
+  t.is(
+    final.item,
+    undefined,
+    'Queue should be empty'
+  )
+})

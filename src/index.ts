@@ -1,6 +1,9 @@
 import { Readable } from 'stream'
 import { monotonicFactory } from 'ulid'
 
+// Create a single ULID factory instance to ensure monotonic ordering
+const ulid = monotonicFactory()
+
 // Error types for database operations
 export class RaceCondition extends Error {
   constructor() {
@@ -57,6 +60,47 @@ export interface AtomicDbQuery {
 }
 
 /**
+ * Queue item with optional sk (auto-generated if not provided)
+ */
+export interface AtomicDbQueueItem
+  extends AtomicDbItem {
+  /** Whether the item is currently being processed */
+  isProcessing: boolean
+  /** Epoch time in seconds when processing timeout expires */
+  processingTimeout: number
+}
+
+/**
+ * Input type for queuePush - fields isProcessing and processingTimeout are set automatically
+ */
+export interface AtomicDbQueueItemInput {
+  /** Primary key (queue identifier) */
+  pk: string
+  /** Sort key - if not provided, ULID will be generated */
+  sk?: string
+  /** The actual data stored in the queue item */
+  data: any
+}
+
+/**
+ * Options for pulling from queue
+ */
+export interface AtomicDbQueuePullOptions {
+  /** Queue identifier (primary key) */
+  pk: string
+  /** Visibility timeout in seconds (lock duration) */
+  ttlSeconds?: number
+}
+
+/**
+ * Result of a pull operation
+ */
+export interface AtomicDbQueuePullResult {
+  /** Single item pulled (undefined if queue empty or all locked) */
+  item?: AtomicDbQueueItem
+}
+
+/**
  * Base interface for database operations
  */
 export interface AtomicDbInterface {
@@ -83,6 +127,14 @@ export interface AtomicDbInterface {
    * If the item doesn't exist, creates a new one with a version and 24h TTL.
    * If the item exists but TTL is less than 1h away, recreates it with a new version and 24h TTL.
    * Lock objects are separate from regular items and are used for optimistic locking.
+   *
+   * Optimistic locking pattern:
+   * 1. Get lock(s) for the item(s) using getLock
+   * 2. Get the current data item(s)
+   * 3. Perform business logic calculations
+   * 4. Use setAtomic with the lock(s) to update the item(s) atomically
+   * 5. If setAtomic throws RaceCondition, the lock version changed - reload locks and retry from step 1
+   *
    * @param key The database item key
    * @returns The found lock object or a new one with initial version
    */
@@ -137,6 +189,203 @@ export interface AtomicDbInterface {
   stream(
     query: AtomicDbQuery
   ): NodeJS.ReadableStream
+
+  /**
+   * Push one or more items to a FIFO queue
+   * @param items The items to push to the queue (isProcessing and processingTimeout are set automatically)
+   */
+  queuePush(
+    items:
+      | AtomicDbQueueItemInput
+      | AtomicDbQueueItemInput[]
+  ): Promise<void>
+
+  /**
+   * Pull one item from queue with locking
+   * @param options The pull options including queue identifier and TTL
+   * @returns The pulled item, or undefined if no items available
+   */
+  queuePull(
+    options: AtomicDbQueuePullOptions
+  ): Promise<AtomicDbQueuePullResult>
+
+  /**
+   * Acknowledge and delete one item from queue
+   * @param key The key of the item to acknowledge
+   */
+  queueAcknowledge(
+    key: AtomicDbItemKey
+  ): Promise<void>
+
+  /**
+   * Release an item back to the queue before timeout expires
+   * Makes the item available for other consumers immediately
+   * @param key The key of the item to release
+   */
+  queueRelease(
+    key: AtomicDbItemKey
+  ): Promise<void>
+}
+
+/**
+ * Helper function to implement queue methods using atomic operations
+ * This provides a shared implementation for all AtomicDbInterface implementations
+ */
+export function createQueueMethods(
+  db: AtomicDbInterface
+) {
+  return {
+    async queuePush(
+      items:
+        | AtomicDbQueueItemInput
+        | AtomicDbQueueItemInput[]
+    ): Promise<void> {
+      const itemArray = Array.isArray(items)
+        ? items
+        : [items]
+      const itemsToSet: AtomicDbQueueItem[] =
+        itemArray.map((item) => ({
+          pk: item.pk,
+          sk: item.sk || ulid(),
+          data: item.data,
+          isProcessing: false,
+          processingTimeout: 0,
+        }))
+      await db.set(itemsToSet)
+    },
+
+    async queuePull(
+      options: AtomicDbQueuePullOptions
+    ): Promise<AtomicDbQueuePullResult> {
+      const timeoutSeconds =
+        options.ttlSeconds || 300 // Default 5 minutes
+      const now = Math.floor(Date.now() / 1000)
+
+      // Query for the first item in the queue (FIFO - limit=1)
+      const items = await db.query({
+        pk: options.pk,
+        limit: 1,
+      })
+
+      // If no items, return empty
+      if (items.length === 0) {
+        return {}
+      }
+
+      // Get the first (and only) item
+      const item = items[0]
+      const queueItem = item as AtomicDbQueueItem
+
+      // Check if item is processing and hasn't timed out
+      const isProcessing =
+        queueItem.isProcessing ?? false
+      const timeout =
+        queueItem.processingTimeout ?? 0
+      if (isProcessing && timeout > now) {
+        // Item is still being processed, return empty
+        return {}
+      }
+
+      // Try to acquire this item
+      const lockKey = {
+        pk: item.pk,
+        sk: item.sk,
+      }
+
+      try {
+        // Get lock first (optimistic locking pattern)
+        const lock = await db.getLock(lockKey)
+
+        // Re-read the item to get latest state
+        const currentItem = await db.get(lockKey)
+        if (!currentItem) {
+          // Item was deleted, return empty
+          return {}
+        }
+
+        const currentQueueItem =
+          currentItem as AtomicDbQueueItem
+
+        // Re-check if item is still available (may have been updated by another consumer)
+        const currentNow = Math.floor(
+          Date.now() / 1000
+        )
+        const currentIsProcessing =
+          currentQueueItem.isProcessing ?? false
+        const currentTimeout =
+          currentQueueItem.processingTimeout ?? 0
+        if (
+          currentIsProcessing &&
+          currentTimeout > currentNow
+        ) {
+          // Item is now being processed by another consumer, return empty
+          return {}
+        }
+
+        // Calculate processing timeout based on current time
+        const processingTimeout =
+          currentNow + timeoutSeconds
+
+        // Update item to isProcessing=true with new timeout
+        const updatedItem: AtomicDbQueueItem = {
+          ...currentQueueItem,
+          isProcessing: true,
+          processingTimeout: processingTimeout,
+        }
+
+        // Use setAtomic to atomically update the item
+        await db.setAtomic(updatedItem, lock)
+
+        return { item: updatedItem }
+      } catch (e) {
+        // RaceCondition - lock version changed, return empty
+        if (e instanceof RaceCondition) {
+          return {}
+        }
+        throw e
+      }
+    },
+
+    async queueAcknowledge(
+      key: AtomicDbItemKey
+    ): Promise<void> {
+      await db.delete(key)
+    },
+
+    async queueRelease(
+      key: AtomicDbItemKey
+    ): Promise<void> {
+      // Get the current item
+      const item = await db.get(key)
+      if (!item) {
+        throw new Error('Item not found')
+      }
+
+      const queueItem = item as AtomicDbQueueItem
+
+      // Get lock for the item
+      const lock = await db.getLock(key)
+
+      // Update item to mark as not processing
+      const updatedItem: AtomicDbQueueItem = {
+        ...queueItem,
+        isProcessing: false,
+        processingTimeout: 0,
+      }
+
+      // Use setAtomic to atomically update the item
+      try {
+        await db.setAtomic(updatedItem, lock)
+      } catch (e) {
+        if (e instanceof RaceCondition) {
+          // Item was modified concurrently, which is fine
+          // The release operation can be retried if needed
+          throw e
+        }
+        throw e
+      }
+    },
+  }
 }
 
 /**
@@ -148,9 +397,33 @@ export class AtomicMemoryDb
   private items: Map<string, AtomicDbItem>
   private locks: Map<string, AtomicDbItemLock>
 
+  // Queue methods
+  queuePush: (
+    items:
+      | AtomicDbQueueItemInput
+      | AtomicDbQueueItemInput[]
+  ) => Promise<void>
+  queuePull: (
+    options: AtomicDbQueuePullOptions
+  ) => Promise<AtomicDbQueuePullResult>
+  queueAcknowledge: (
+    key: AtomicDbItemKey
+  ) => Promise<void>
+  queueRelease: (
+    key: AtomicDbItemKey
+  ) => Promise<void>
+
   constructor() {
     this.items = new Map()
     this.locks = new Map()
+
+    // Initialize queue methods
+    const queueMethods = createQueueMethods(this)
+    this.queuePush = queueMethods.queuePush
+    this.queuePull = queueMethods.queuePull
+    this.queueAcknowledge =
+      queueMethods.queueAcknowledge
+    this.queueRelease = queueMethods.queueRelease
   }
 
   private getKey(key: AtomicDbItemKey): string {
@@ -208,7 +481,7 @@ export class AtomicMemoryDb
         const newLock: AtomicDbItemLock = {
           pk: key.pk,
           sk: key.sk,
-          version: monotonicFactory()(),
+          version: ulid(),
           ttl,
         }
         this.locks.set(k, newLock)
@@ -368,6 +641,22 @@ export class AtomicLRUCache
   private cache: any // LRUCacheWithDelete type
   private getKey: (key: AtomicDbItemKey) => string
 
+  // Queue methods
+  queuePush: (
+    items:
+      | AtomicDbQueueItemInput
+      | AtomicDbQueueItemInput[]
+  ) => Promise<void>
+  queuePull: (
+    options: AtomicDbQueuePullOptions
+  ) => Promise<AtomicDbQueuePullResult>
+  queueAcknowledge: (
+    key: AtomicDbItemKey
+  ) => Promise<void>
+  queueRelease: (
+    key: AtomicDbItemKey
+  ) => Promise<void>
+
   constructor(
     db: AtomicDbInterface,
     cacheSize: number
@@ -377,6 +666,14 @@ export class AtomicLRUCache
     this.cache = new LRUCacheWithDelete(cacheSize)
     this.getKey = (key: AtomicDbItemKey) =>
       `${key.pk}/${key.sk}`
+
+    // Initialize queue methods
+    const queueMethods = createQueueMethods(this)
+    this.queuePush = queueMethods.queuePush
+    this.queuePull = queueMethods.queuePull
+    this.queueAcknowledge =
+      queueMethods.queueAcknowledge
+    this.queueRelease = queueMethods.queueRelease
   }
 
   async get(
