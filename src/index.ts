@@ -4,6 +4,19 @@ import { monotonicFactory } from 'ulid'
 // Create a single ULID factory instance to ensure monotonic ordering
 const ulid = monotonicFactory()
 
+/**
+ * Helper function to transform a key for lock storage
+ * Automatically prepends "__LOCK__" to the primary key
+ */
+function getLockKey(
+  key: AtomicDbItemKey
+): AtomicDbItemKey {
+  return {
+    pk: `__LOCK__${key.pk}`,
+    sk: key.sk,
+  }
+}
+
 // Error types for database operations
 export class RaceCondition extends Error {
   constructor() {
@@ -60,10 +73,19 @@ export interface AtomicDbQuery {
 }
 
 /**
- * Queue item with optional sk (auto-generated if not provided)
+ * Queue item with enqueued timestamp and processing state
  */
-export interface AtomicDbQueueItem
-  extends AtomicDbItem {
+export interface AtomicDbQueueItem {
+  /** Primary key (queue identifier) */
+  pk: string
+  /** Sort key (item identifier for deduplication) */
+  sk: string
+  /** The actual data stored in the queue item */
+  data: any
+  /** ULID of the item when it was enqueued, could be two values if the item
+   * was enqueued while being processed.
+   */
+  enqueued: string[]
   /** Whether the item is currently being processed */
   isProcessing: boolean
   /** Epoch time in seconds when processing timeout expires */
@@ -76,8 +98,8 @@ export interface AtomicDbQueueItem
 export interface AtomicDbQueueItemInput {
   /** Primary key (queue identifier) */
   pk: string
-  /** Sort key - if not provided, ULID will be generated */
-  sk?: string
+  /** Sort key (item identifier for deduplication) - required for deduplication */
+  sk: string
   /** The actual data stored in the queue item */
   data: any
 }
@@ -233,6 +255,29 @@ export interface AtomicDbInterface {
 }
 
 /**
+ * Helper functions for queue collection keys
+ */
+function getFifoKey(
+  pk: string,
+  ulid: string
+): AtomicDbItemKey {
+  return {
+    pk: `__FIFO__${pk}`,
+    sk: ulid,
+  }
+}
+
+function getDedupKey(
+  pk: string,
+  sk: string
+): AtomicDbItemKey {
+  return {
+    pk: `__FIFO_DEDUP__${pk}`,
+    sk: sk,
+  }
+}
+
+/**
  * Helper function to implement queue methods using atomic operations
  * This provides a shared implementation for all AtomicDbInterface implementations
  */
@@ -248,15 +293,195 @@ export function createQueueMethods(
       const itemArray = Array.isArray(items)
         ? items
         : [items]
-      const itemsToSet: AtomicDbQueueItem[] =
-        itemArray.map((item) => ({
-          pk: item.pk,
-          sk: item.sk || ulid(),
-          data: item.data,
-          isProcessing: false,
-          processingTimeout: 0,
-        }))
-      await db.set(itemsToSet)
+
+      for (const item of itemArray) {
+        const dedupKey = getDedupKey(
+          item.pk,
+          item.sk
+        )
+        const now = Math.floor(Date.now() / 1000)
+
+        // Get lock for dedup record to avoid race conditions
+        const dedupLock = await db.getLock(
+          dedupKey
+        )
+
+        // Read current dedup record
+        const dedupRecord = await db.get(dedupKey)
+        const dedupData = dedupRecord as
+          | (AtomicDbItem & {
+              enqueued: string[]
+              isProcessing: boolean
+              processingTimeout: number
+            })
+          | undefined
+
+        if (!dedupData) {
+          // Not enqueued - create new records
+          const newUlid = ulid()
+          const fifoKey = getFifoKey(
+            item.pk,
+            newUlid
+          )
+          const fifoLock = await db.getLock(
+            fifoKey
+          )
+
+          // Create FIFO record: { itemKey: <sk>, data: <data> }
+          const fifoItem: AtomicDbItem = {
+            pk: fifoKey.pk,
+            sk: fifoKey.sk,
+            data: {
+              itemKey: item.sk,
+              data: item.data,
+            },
+          }
+
+          // Create DEDUP record: { enqueued: [ulid], isProcessing: false, processingTimeout: 0 }
+          const newDedupItem: AtomicDbItem = {
+            pk: dedupKey.pk,
+            sk: dedupKey.sk,
+            data: {
+              enqueued: [newUlid],
+              isProcessing: false,
+              processingTimeout: 0,
+            },
+          }
+
+          await db.setAtomic(
+            [fifoItem, newDedupItem],
+            [fifoLock, dedupLock]
+          )
+        } else {
+          const enqueued =
+            dedupData.data?.enqueued || []
+          const isProcessing =
+            dedupData.data?.isProcessing || false
+          const processingTimeout =
+            dedupData.data?.processingTimeout || 0
+          const isProcessingExpired =
+            isProcessing &&
+            processingTimeout <= now
+
+          if (
+            !isProcessing ||
+            isProcessingExpired
+          ) {
+            // Enqueued but not processing (or expired) - update existing FIFO record
+            const oldestUlid = enqueued[0]
+            if (!oldestUlid) {
+              // Should not happen, but handle gracefully
+              const newUlid = ulid()
+              const fifoKey = getFifoKey(
+                item.pk,
+                newUlid
+              )
+              const fifoLock = await db.getLock(
+                fifoKey
+              )
+
+              const fifoItem: AtomicDbItem = {
+                pk: fifoKey.pk,
+                sk: fifoKey.sk,
+                data: {
+                  itemKey: item.sk,
+                  data: item.data,
+                },
+              }
+
+              const updatedDedupItem: AtomicDbItem =
+                {
+                  pk: dedupKey.pk,
+                  sk: dedupKey.sk,
+                  data: {
+                    enqueued: [newUlid],
+                    isProcessing: false,
+                    processingTimeout: 0,
+                  },
+                }
+
+              await db.setAtomic(
+                [fifoItem, updatedDedupItem],
+                [fifoLock, dedupLock]
+              )
+            } else {
+              // Update existing FIFO record (maintains position)
+              const fifoKey = getFifoKey(
+                item.pk,
+                oldestUlid
+              )
+              const fifoLock = await db.getLock(
+                fifoKey
+              )
+
+              const fifoItem: AtomicDbItem = {
+                pk: fifoKey.pk,
+                sk: fifoKey.sk,
+                data: {
+                  itemKey: item.sk,
+                  data: item.data,
+                },
+              }
+
+              const updatedDedupItem: AtomicDbItem =
+                {
+                  pk: dedupKey.pk,
+                  sk: dedupKey.sk,
+                  data: {
+                    enqueued: enqueued, // Keep same ULID
+                    isProcessing: false,
+                    processingTimeout: 0,
+                  },
+                }
+
+              await db.setAtomic(
+                [fifoItem, updatedDedupItem],
+                [fifoLock, dedupLock]
+              )
+            }
+          } else {
+            // Enqueued and currently processing - create new FIFO record
+            const newUlid = ulid()
+            const fifoKey = getFifoKey(
+              item.pk,
+              newUlid
+            )
+            const fifoLock = await db.getLock(
+              fifoKey
+            )
+
+            const fifoItem: AtomicDbItem = {
+              pk: fifoKey.pk,
+              sk: fifoKey.sk,
+              data: {
+                itemKey: item.sk,
+                data: item.data,
+              },
+            }
+
+            // Append new ULID to enqueued array
+            const updatedDedupItem: AtomicDbItem =
+              {
+                pk: dedupKey.pk,
+                sk: dedupKey.sk,
+                data: {
+                  enqueued: [
+                    ...enqueued,
+                    newUlid,
+                  ],
+                  isProcessing: isProcessing,
+                  processingTimeout:
+                    processingTimeout,
+                },
+              }
+
+            await db.setAtomic(
+              [fifoItem, updatedDedupItem],
+              [fifoLock, dedupLock]
+            )
+          }
+        }
+      }
     },
 
     async queuePull(
@@ -266,9 +491,10 @@ export function createQueueMethods(
         options.ttlSeconds || 300 // Default 5 minutes
       const now = Math.floor(Date.now() / 1000)
 
-      // Query for the first item in the queue (FIFO - limit=1)
+      // Query __FIFO__ collection for first item (sorted by ULID)
+      const fifoPk = `__FIFO__${options.pk}`
       const items = await db.query({
-        pk: options.pk,
+        pk: fifoPk,
         limit: 1,
       })
 
@@ -277,71 +503,102 @@ export function createQueueMethods(
         return {}
       }
 
-      // Get the first (and only) item
-      const item = items[0]
-      const queueItem = item as AtomicDbQueueItem
+      // Get the first (and only) item from FIFO collection
+      const fifoItem = items[0]
+      const fifoData = fifoItem.data as
+        | { itemKey: string; data: any }
+        | undefined
 
-      // Check if item is processing and hasn't timed out
-      const isProcessing =
-        queueItem.isProcessing ?? false
-      const timeout =
-        queueItem.processingTimeout ?? 0
-      if (isProcessing && timeout > now) {
-        // Item is still being processed, return empty
+      if (!fifoData || !fifoData.itemKey) {
+        // Invalid FIFO record, return empty
         return {}
       }
 
-      // Try to acquire this item
-      const lockKey = {
-        pk: item.pk,
-        sk: item.sk,
-      }
+      const itemSk = fifoData.itemKey
+      const itemData = fifoData.data
+
+      // Look up dedup record using the itemKey (sk)
+      const dedupKey = getDedupKey(
+        options.pk,
+        itemSk
+      )
 
       try {
-        // Get lock first (optimistic locking pattern)
-        const lock = await db.getLock(lockKey)
+        // Get lock for dedup record
+        const dedupLock = await db.getLock(
+          dedupKey
+        )
 
-        // Re-read the item to get latest state
-        const currentItem = await db.get(lockKey)
-        if (!currentItem) {
-          // Item was deleted, return empty
+        // Re-read dedup record to get latest state
+        const dedupRecord = await db.get(dedupKey)
+        if (!dedupRecord) {
+          // Dedup record missing, return empty
           return {}
         }
 
-        const currentQueueItem =
-          currentItem as AtomicDbQueueItem
+        const dedupData = dedupRecord.data as
+          | {
+              enqueued: string[]
+              isProcessing: boolean
+              processingTimeout: number
+            }
+          | undefined
 
-        // Re-check if item is still available (may have been updated by another consumer)
+        if (!dedupData) {
+          return {}
+        }
+
+        const enqueued = dedupData.enqueued || []
+        const isProcessing =
+          dedupData.isProcessing || false
+        const processingTimeout =
+          dedupData.processingTimeout || 0
+
+        // Check if item is available (not processing or timeout expired)
         const currentNow = Math.floor(
           Date.now() / 1000
         )
-        const currentIsProcessing =
-          currentQueueItem.isProcessing ?? false
-        const currentTimeout =
-          currentQueueItem.processingTimeout ?? 0
         if (
-          currentIsProcessing &&
-          currentTimeout > currentNow
+          isProcessing &&
+          processingTimeout > currentNow
         ) {
-          // Item is now being processed by another consumer, return empty
+          // Item is still being processed, return empty
           return {}
         }
 
-        // Calculate processing timeout based on current time
-        const processingTimeout =
+        // Calculate new processing timeout
+        const newProcessingTimeout =
           currentNow + timeoutSeconds
 
-        // Update item to isProcessing=true with new timeout
-        const updatedItem: AtomicDbQueueItem = {
-          ...currentQueueItem,
-          isProcessing: true,
-          processingTimeout: processingTimeout,
+        // Update dedup record to mark as processing
+        const updatedDedupItem: AtomicDbItem = {
+          pk: dedupKey.pk,
+          sk: dedupKey.sk,
+          data: {
+            enqueued: enqueued,
+            isProcessing: true,
+            processingTimeout:
+              newProcessingTimeout,
+          },
         }
 
-        // Use setAtomic to atomically update the item
-        await db.setAtomic(updatedItem, lock)
+        // Use setAtomic to atomically update the dedup record
+        await db.setAtomic(
+          updatedDedupItem,
+          dedupLock
+        )
 
-        return { item: updatedItem }
+        // Return reconstructed item
+        const resultItem: AtomicDbQueueItem = {
+          pk: options.pk,
+          sk: itemSk,
+          data: itemData,
+          enqueued: enqueued,
+          isProcessing: true,
+          processingTimeout: newProcessingTimeout,
+        }
+
+        return { item: resultItem }
       } catch (e) {
         // RaceCondition - lock version changed, return empty
         if (e instanceof RaceCondition) {
@@ -354,33 +611,114 @@ export function createQueueMethods(
     async queueAcknowledge(
       key: AtomicDbItemKey
     ): Promise<void> {
-      await db.delete(key)
+      const dedupKey = getDedupKey(key.pk, key.sk)
+
+      // Get lock for dedup record
+      const dedupLock = await db.getLock(dedupKey)
+
+      // Read dedup record to get enqueued array
+      const dedupRecord = await db.get(dedupKey)
+      if (!dedupRecord) {
+        throw new Error('Item not found in queue')
+      }
+
+      const dedupData = dedupRecord.data as
+        | {
+            enqueued: string[]
+            isProcessing: boolean
+            processingTimeout: number
+          }
+        | undefined
+
+      if (
+        !dedupData ||
+        !dedupData.enqueued ||
+        dedupData.enqueued.length === 0
+      ) {
+        throw new Error('Item not found in queue')
+      }
+
+      const enqueued = dedupData.enqueued
+      const oldestUlid = enqueued[0]
+
+      // Delete FIFO record for oldest ULID
+      const fifoKey = getFifoKey(
+        key.pk,
+        oldestUlid
+      )
+      await db.delete(fifoKey)
+
+      // Remove first ULID from enqueued array
+      const remainingUlids = enqueued.slice(1)
+
+      if (remainingUlids.length === 0) {
+        // Delete dedup record if no more ULIDs
+        await db.delete(dedupKey)
+      } else {
+        // Update dedup record with remaining ULIDs
+        const updatedDedupItem: AtomicDbItem = {
+          pk: dedupKey.pk,
+          sk: dedupKey.sk,
+          data: {
+            enqueued: remainingUlids,
+            isProcessing: false,
+            processingTimeout: 0,
+          },
+        }
+
+        await db.setAtomic(
+          updatedDedupItem,
+          dedupLock
+        )
+      }
     },
 
     async queueRelease(
       key: AtomicDbItemKey
     ): Promise<void> {
-      // Get the current item
-      const item = await db.get(key)
-      if (!item) {
-        throw new Error('Item not found')
+      const dedupKey = getDedupKey(key.pk, key.sk)
+
+      // Get lock for dedup record
+      const dedupLock = await db.getLock(dedupKey)
+
+      // Read dedup record
+      const dedupRecord = await db.get(dedupKey)
+      if (!dedupRecord) {
+        throw new Error('Item not found in queue')
       }
 
-      const queueItem = item as AtomicDbQueueItem
+      const dedupData = dedupRecord.data as
+        | {
+            enqueued: string[]
+            isProcessing: boolean
+            processingTimeout: number
+          }
+        | undefined
 
-      // Get lock for the item
-      const lock = await db.getLock(key)
-
-      // Update item to mark as not processing
-      const updatedItem: AtomicDbQueueItem = {
-        ...queueItem,
-        isProcessing: false,
-        processingTimeout: 0,
+      if (!dedupData) {
+        throw new Error('Item not found in queue')
       }
 
-      // Use setAtomic to atomically update the item
+      const enqueued = dedupData.enqueued || []
+
+      // Update dedup record to mark as not processing
+      // Keep enqueued array unchanged
+      const updatedDedupItem: AtomicDbItem = {
+        pk: dedupKey.pk,
+        sk: dedupKey.sk,
+        data: {
+          enqueued: enqueued,
+          isProcessing: false,
+          processingTimeout: 0,
+        },
+      }
+
+      // Use setAtomic to atomically update the dedup record
       try {
-        await db.setAtomic(updatedItem, lock)
+        await db.setAtomic(
+          updatedDedupItem,
+          dedupLock
+        )
       } catch (e) {
         if (e instanceof RaceCondition) {
           // Item was modified concurrently, which is fine
@@ -472,7 +810,9 @@ export class AtomicMemoryDb
   async getLock(
     key: AtomicDbItemKey
   ): Promise<AtomicDbItemLock> {
-    const k = this.getKey(key)
+    // Transform key for internal storage (prepend __LOCK__ to pk)
+    const lockKey = getLockKey(key)
+    const k = this.getKey(lockKey)
     const now = Math.floor(Date.now() / 1000)
     const ttl = now + 24 * 60 * 60 // 24 hours
 
@@ -484,7 +824,7 @@ export class AtomicMemoryDb
         existingLock.ttl - now < 60 * 60
       ) {
         const newLock: AtomicDbItemLock = {
-          pk: key.pk,
+          pk: key.pk, // Return original key (without __LOCK__ prefix)
           sk: key.sk,
           version: ulid(),
           ttl,
@@ -492,12 +832,17 @@ export class AtomicMemoryDb
         this.locks.set(k, newLock)
         return newLock
       }
-      return existingLock
+      // Return lock with original key (without __LOCK__ prefix)
+      return {
+        ...existingLock,
+        pk: key.pk,
+        sk: key.sk,
+      }
     }
 
     // Create new lock
     const newLock: AtomicDbItemLock = {
-      pk: key.pk,
+      pk: key.pk, // Return original key (without __LOCK__ prefix)
       sk: key.sk,
       version: monotonicFactory()(),
       ttl,
@@ -537,7 +882,9 @@ export class AtomicMemoryDb
     // Check all locks first
     for (let i = 0; i < lockArray.length; i++) {
       const lock = lockArray[i]
-      const k = this.getKey(lock)
+      // Transform lock key for internal lookup (prepend __LOCK__ to pk)
+      const lockKey = getLockKey(lock)
+      const k = this.getKey(lockKey)
       const existingLock = this.locks.get(k)
 
       if (
@@ -552,19 +899,21 @@ export class AtomicMemoryDb
     for (let i = 0; i < itemArray.length; i++) {
       const item = itemArray[i]
       const lock = lockArray[i]
-      const k = this.getKey(item)
+      const itemK = this.getKey(item)
 
       // Update item
-      this.items.set(k, item)
+      this.items.set(itemK, item)
 
-      // Update lock with new version
+      // Update lock with new version (using transformed key for storage)
+      const lockKey = getLockKey(lock)
+      const lockK = this.getKey(lockKey)
       const newLock: AtomicDbItemLock = {
-        pk: lock.pk,
+        pk: lock.pk, // Store original key in lock object
         sk: lock.sk,
         version: monotonicFactory()(),
         ttl: lock.ttl,
       }
-      this.locks.set(this.getKey(lock), newLock)
+      this.locks.set(lockK, newLock)
     }
   }
 
@@ -577,7 +926,10 @@ export class AtomicMemoryDb
     for (const key of keyArray) {
       const k = this.getKey(key)
       this.items.delete(k)
-      this.locks.delete(k)
+      // Delete lock using transformed key (prepend __LOCK__ to pk)
+      const lockKey = getLockKey(key)
+      const lockK = this.getKey(lockKey)
+      this.locks.delete(lockK)
     }
   }
 

@@ -596,9 +596,21 @@ test('queue basic push/pull/acknowledge flow', async (t) => {
 
   // Push items to queue
   await db.queuePush([
-    { pk: queuePk, data: { message: 'first' } },
-    { pk: queuePk, data: { message: 'second' } },
-    { pk: queuePk, data: { message: 'third' } },
+    {
+      pk: queuePk,
+      sk: 'item-1',
+      data: { message: 'first' },
+    },
+    {
+      pk: queuePk,
+      sk: 'item-2',
+      data: { message: 'second' },
+    },
+    {
+      pk: queuePk,
+      sk: 'item-3',
+      data: { message: 'third' },
+    },
   ])
 
   // Pull first item
@@ -686,19 +698,31 @@ test('queue basic push/pull/acknowledge flow', async (t) => {
   )
 })
 
-test('queue FIFO ordering with auto-generated sk', async (t) => {
+test('queue FIFO ordering with explicit sk', async (t) => {
   const queuePk = 'test-queue-ordering'
 
-  // Push items without sk (should auto-generate)
-  await db.queuePush({ pk: queuePk, data: 1 })
+  // Push items with explicit sk
+  await db.queuePush({
+    pk: queuePk,
+    sk: 'item-1',
+    data: 1,
+  })
   await new Promise((resolve) =>
     setTimeout(resolve, 10)
   ) // Small delay for ULID ordering
-  await db.queuePush({ pk: queuePk, data: 2 })
+  await db.queuePush({
+    pk: queuePk,
+    sk: 'item-2',
+    data: 2,
+  })
   await new Promise((resolve) =>
     setTimeout(resolve, 10)
   )
-  await db.queuePush({ pk: queuePk, data: 3 })
+  await db.queuePush({
+    pk: queuePk,
+    sk: 'item-3',
+    data: 3,
+  })
 
   // Pull items in order
   const results: number[] = []
@@ -862,11 +886,11 @@ test('queue multiple consumers process items sequentially (strict FIFO)', async 
 
   // Push 5 items
   await db.queuePush([
-    { pk: queuePk, data: 1 },
-    { pk: queuePk, data: 2 },
-    { pk: queuePk, data: 3 },
-    { pk: queuePk, data: 4 },
-    { pk: queuePk, data: 5 },
+    { pk: queuePk, sk: 'item-1', data: 1 },
+    { pk: queuePk, sk: 'item-2', data: 2 },
+    { pk: queuePk, sk: 'item-3', data: 3 },
+    { pk: queuePk, sk: 'item-4', data: 4 },
+    { pk: queuePk, sk: 'item-5', data: 5 },
   ])
 
   // Simulate consumers processing items sequentially (strict FIFO)
@@ -929,9 +953,9 @@ test('queue with LRU cache', async (t) => {
 
   // Push items through cache
   await cachedDb.queuePush([
-    { pk: queuePk, data: 'A' },
-    { pk: queuePk, data: 'B' },
-    { pk: queuePk, data: 'C' },
+    { pk: queuePk, sk: 'item-A', data: 'A' },
+    { pk: queuePk, sk: 'item-B', data: 'B' },
+    { pk: queuePk, sk: 'item-C', data: 'C' },
   ])
 
   // Pull and acknowledge through cache

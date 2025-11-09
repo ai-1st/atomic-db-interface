@@ -5,7 +5,7 @@ A TypeScript interface and implementations for databases supporting atomic opera
 ## Features
 
 - **Database Agnostic Interface**: Provides a common interface for any database implementation
-- **Atomic Operations**: Perform atomic updates with optimistic locking to prevent race conditions
+- **Atomic Operations**: Perform atomic updates with optimistic locking to resolve race conditions
 - **Separate Lock Objects**: Lock objects are stored separately from items, allowing for flexible locking strategies
 - **Automatic Lock Management**: Locks automatically expire and refresh when nearing expiration
 - **FIFO Queue Support**: Built-in FIFO queue operations with optimistic locking and visibility timeout
@@ -71,18 +71,16 @@ await db.delete({
 ```typescript
 import { RaceCondition } from 'atomic-db-interface'
 
-// Define keys for the data item and its lock
+// Define the key for the data item
+// getLock and setAtomic automatically handle lock key transformation
 const itemKey = {
   pk: 'user#123',
   sk: 'counter',
 }
-const lockKey = {
-  pk: 'user#123',
-  sk: 'counter#lock',
-}
 
 // Get or create a lock (automatically expires after 24 hours)
-const lock = await db.getLock(lockKey)
+// getLock automatically prepends "__LOCK__" to the pk internally
+const lock = await db.getLock(itemKey)
 
 // Update item atomically
 try {
@@ -102,44 +100,40 @@ try {
 }
 
 // Clean up (optional)
-await db.delete([lockKey, itemKey])
+// delete automatically removes both the item and its lock
+await db.delete(itemKey)
 ```
 
 ### Best Practices for Locks
 
-1. **Separate Keys**: Always use different keys for locks and data items
+1. **Use the Same Key**: You can use the same key for both the item and its lock
+
+   `getLock` and `setAtomic` automatically handle lock key transformation by prepending `"__LOCK__"` to the primary key internally. You never need to manually create separate lock keys.
 
    ```typescript
-   // Good
+   // Good - use the same key for both item and lock
    const itemKey = { pk: 'user#123', sk: 'data' }
-   const lockKey = {
-     pk: 'user#123',
-     sk: 'data#lock',
-   }
+   const lock = await db.getLock(itemKey) // Automatically uses __LOCK__user#123 internally
+   await db.setAtomic(item, lock) // Works with the same key
 
-   // Bad - using same key for both
-   const key = { pk: 'user#123', sk: 'data' }
+   // The library automatically transforms the lock key internally:
+   // Item stored at: { pk: 'user#123', sk: 'data' }
+   // Lock stored at: { pk: '__LOCK__user#123', sk: 'data' }
    ```
 
-2. **Consistent Naming**: Use a predictable pattern for lock keys
-
-   ```typescript
-   // Examples:
-   sk: 'profile#lock' // For profile data
-   sk: 'settings#lock' // For settings data
-   sk: 'counter#lock' // For counter data
-   ```
-
-3. **Lock Lifecycle**: Locks are automatically managed
+2. **Lock Lifecycle**: Locks are automatically managed
 
    - New locks expire after 24 hours
    - Locks are automatically refreshed when accessed within their last hour
    - No manual TTL management required
 
-4. **Clean Up**: Remember to delete locks when they're no longer needed
+3. **Clean Up**: The `delete` method automatically removes both the item and its lock
    ```typescript
-   // Clean up both the data and lock
-   await db.delete([itemKey, lockKey])
+   // Clean up both the data and lock automatically
+   await db.delete(itemKey)
+   // Internally deletes both:
+   // - Item at: { pk: 'user#123', sk: 'data' }
+   // - Lock at: { pk: '__LOCK__user#123', sk: 'data' }
    ```
 
 ### Batch Operations
@@ -404,7 +398,7 @@ You can implement `AtomicDbInterface` for any database. The interface defines:
 
 The interface uses optimistic locking with automatic TTL management to prevent race conditions in atomic operations. Here's how it works:
 
-1. Lock objects are stored separately from the actual items using different sort keys
+1. Lock objects are stored separately from the actual items - `getLock` and `setAtomic` automatically prepend `"__LOCK__"` to the primary key internally, so you can use the same key for both items and locks
 2. Each lock object has a version that's updated on every atomic operation
 3. Locks automatically expire after 24 hours via TTL feature
 4. When a lock is accessed within its last hour of validity, it's automatically refreshed with a new 24-hour TTL
